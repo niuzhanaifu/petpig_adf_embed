@@ -1,0 +1,8 @@
+menu "Pig server configuration"
+
+    config DEBUG_SMALL_PIG
+        bool "Debug small pig"
+        default n
+        help
+            Debug small pig.
+endmenu

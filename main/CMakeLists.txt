@@ -1,5 +1,4 @@
-set(COMPONENT_SRCS ./play_mp3_control_example.c ./esp_websocket_client.c ./es8311.c ./src_wifi.c ./esp_websocket_client.c)
+set(COMPONENT_SRCS ./main.c ./esp_websocket_client.c ./es8311.c ./src_wifi.c ./esp_websocket_client.c)
 set(COMPONENT_ADD_INCLUDEDIRS "./include")
-# set(COMPONENT_EMBED_TXTFILES music-16b-2c-8000hz.mp3 music-16b-2c-22050hz.mp3 music-16b-2c-44100hz.mp3)
-set(COMPONENT_EMBED_TXTFILES "ack2.wav")
+set(COMPONENT_EMBED_TXTFILES "../extern_files/rcv.pcm")
 register_component()

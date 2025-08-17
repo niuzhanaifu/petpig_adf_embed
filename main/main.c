@@ -76,7 +76,7 @@ static esp_err_t i2s_driver_init(pignet_server_handle_t p)
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &p->tx_handle, &p->rx_handle));
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(USER_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_MCK_IO,
             .bclk = I2S_BCK_IO,
@@ -106,53 +106,51 @@ RingBuffer* ringbuf_init(size_t capacity) {
     RingBuffer *rb = malloc(sizeof(RingBuffer));
     rb->buffer = malloc(capacity);
     rb->capacity = capacity;
-    rb->in = rb->out = rb->len = 0;
+    rb->in = rb->out = 0;
     rb->mutex = xSemaphoreCreateMutex();
-    rb->sem = xSemaphoreCreateCounting(capacity, 0);
     return rb;
 }
 
 size_t ringbuf_write(RingBuffer *rb, const uint8_t *data, size_t len) {
     xSemaphoreTake(rb->mutex, portMAX_DELAY);
-    size_t write_len = MIN(len, rb->capacity - rb->len);
-    if (write_len == 0) {
-        xSemaphoreGive(rb->mutex);
+    size_t write_len = len;
+    if (write_len > rb->capacity) {
+        data += (write_len - rb->capacity);
+        write_len = rb->capacity;
+    }
+    size_t used = (rb->in + rb->capacity - rb->out) % rb->capacity;
+    size_t space = rb->capacity - used;
+    if (write_len > space) {
+        // 覆盖旧数据，调整out指针
         ESP_LOGE(RING_BUF, "ring buf is full!");
-        return 0;
+        rb->out = (rb->out + (write_len - space)) % rb->capacity;
     }
     size_t first = MIN(write_len, rb->capacity - rb->in);
     memcpy(rb->buffer + rb->in, data, first);
-    size_t second = write_len - first;
-    if (second > 0) {
-        memcpy(rb->buffer, data + first, second);
+    if (write_len > first) {
+        memcpy(rb->buffer, data + first, write_len - first);
     }
-
     rb->in = (rb->in + write_len) % rb->capacity;
-    rb->len += write_len;
     xSemaphoreGive(rb->mutex);
-    xSemaphoreGive(rb->sem);
     return write_len;
 }
 
 size_t ringbuf_read(RingBuffer *rb, uint8_t *data, size_t len, TickType_t timeout) {
-    if (xSemaphoreTake(rb->sem, timeout) != pdTRUE) {
+    if (xSemaphoreTake(rb->mutex, timeout) != pdTRUE) {
         return 0;
     }
-    // if (rb->len < SEND_I2S_SZIE) {
-    //     return 0;
-    // }
-    xSemaphoreTake(rb->mutex, portMAX_DELAY);
-    size_t read_len = MIN(len, rb->len);
-
+    size_t used = (rb->in + rb->capacity - rb->out) % rb->capacity;
+    size_t read_len = MIN(len, used);
+    if (read_len == 0) {
+        xSemaphoreGive(rb->mutex);
+        return 0;
+    }
     size_t first = MIN(read_len, rb->capacity - rb->out);
     memcpy(data, rb->buffer + rb->out, first);
-    size_t second = read_len - first;
-    if (second > 0) {
-        memcpy(data + first, rb->buffer, second);
+    if (read_len > first) {
+        memcpy(data + first, rb->buffer, read_len - first);
     }
-
     rb->out = (rb->out + read_len) % rb->capacity;
-    rb->len -= read_len;
     xSemaphoreGive(rb->mutex);
     return read_len;
 }
@@ -203,6 +201,7 @@ static void send_msg_websocket_task(void *arg)
         memset(buffer, 0, MAX_RECV_BUF_SIZE);
         size_t read_len = ringbuf_read(p->mic_ringbuf, (uint8_t *)buffer, MAX_RECV_BUF_SIZE, pdMS_TO_TICKS(100));
         if (read_len == 0) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
         if (esp_websocket_client_is_connected(p->client) && wifi_connected() == ESP_OK && p->request_tag == false) {
@@ -267,6 +266,7 @@ static void i2s_send(void *args)
     while(1) {
         read_len = ringbuf_read(p->audio_ringbuf, i2s_buffer, MAX_RECV_BUF_SIZE, pdMS_TO_TICKS(200));
         if (read_len == 0) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
 
@@ -494,7 +494,7 @@ void app_main(void)
     }
     pig_server->audio_ringbuf = ringbuf_init(RING_BUF_MAX);
     pig_server->mic_ringbuf = ringbuf_init(MIC_BUF_MAX);
-    pig_server->vad = vad_create(VAD_MODE_4);
+    pig_server->vad = vad_create(VAD_MODE_2);
     pig_server->recive_music_status = END_VOICE;
     pig_server->request_tag = false;
     pig_server->server_finish = false;

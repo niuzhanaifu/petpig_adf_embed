@@ -8,29 +8,14 @@
 #include "esp_log.h"
 #include "esp_netif_net_stack.h"
 #include "esp_netif.h"
-#include "nvs_flash.h"
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #include "driver/gpio.h"
-#if IP_NAPT
-#include "lwip/lwip_napt.h"
-#endif
 #include "lwip/err.h"
 #include "lwip/sys.h"
-#include "inc_wifi.h"
+#include "pig_wifi.h"
 #include "pig_server.h"
-/* STA Configuration */
-#define EXAMPLE_ESP_WIFI_STA_SSID           "ChinaNet-QeVv"
-#define EXAMPLE_ESP_WIFI_STA_PASSWD         "qweasdzxc"
-#define EXAMPLE_ESP_MAXIMUM_RETRY           10
-
-/* AP Configuration */
-#define EXAMPLE_ESP_WIFI_AP_SSID            "paipaizhu"
-#define EXAMPLE_ESP_WIFI_AP_PASSWD          "12345678"
-#define EXAMPLE_ESP_WIFI_CHANNEL            1
-#define EXAMPLE_MAX_STA_CONN                4
-
 
 /* The event group allows multiple bits for each event, but we only care about two events:
  * - we are connected to the AP with an IP
@@ -144,6 +129,12 @@ void softap_set_dns_addr(esp_netif_t *esp_netif_ap,esp_netif_t *esp_netif_sta)
     ESP_ERROR_CHECK(esp_netif_dhcps_option(esp_netif_ap, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &dhcps_offer_option, sizeof(dhcps_offer_option)));
     ESP_ERROR_CHECK(esp_netif_set_dns_info(esp_netif_ap, ESP_NETIF_DNS_MAIN, &dns));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_start(esp_netif_ap));
+}
+
+esp_err_t wifi_connected(void)
+{
+    wifi_ap_record_t   ap_record = {0};
+    return esp_wifi_sta_get_ap_info(&ap_record);
 }
 
 esp_err_t init_wifi()

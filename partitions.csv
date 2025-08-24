@@ -3,4 +3,5 @@
 nvs,      data, nvs,     ,        0x6000,
 phy_init, data, phy,     ,        0x1000,
 factory,  app,  factory, ,        2M,
+model,    data, spiffs,  ,        5120K,
 coredump, data, coredump,,        128K

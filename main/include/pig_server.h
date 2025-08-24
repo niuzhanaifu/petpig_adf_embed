@@ -6,6 +6,11 @@
 #include "esp_check.h"
 #include "esp_http_client.h"
 #include "esp_vad.h"
+#include "audio_pipeline.h"
+#include "audio_element.h"
+#include "esp_wn_iface.h"
+#include "esp_wn_models.h"
+#include "model_path.h"
 #include <esp_websocket_client.h>
 
 #define PIG_SERVRE    "pig_server"
@@ -16,29 +21,57 @@
 #define REV_TAG       "i2s_recive"
 #define SND_TAG       "i2s_send"
 #define RING_BUF      "ring_buf"
+#define PIG_STATUS    "PIG_STATUS"
 
-#define HC_GPIO_INPUT_IO       GPIO_NUM_18
 #define HC_GPIO_INPUT_PIN_SEL  (1ULL << HC_GPIO_INPUT_IO)
 
+// 麦克风的不同收音状态
 typedef enum {
-    BEGIN_VOICE = 0,
-    DURING_VOICE = 1,
-    END_VOICE = 2
+    MIC_SALIENT = 0,
+    MIC_DETECT = 1,
+    BEGIN_VOICE = 2,
+    DURING_VOICE = 3,
+    END_VOICE = 4
 } voice_status_tag;
 
-#define RING_BUF_MAX (96 * 1024)
-#define MIC_BUF_MAX (48 * 1024)
+// 从服务器接收数据流的不同状态
+typedef enum {
+    SERVER_STREAM_IS_FINAL = 0,
+    SERVER_STREAM_TEXT_RESPONSE = 1,
+    SERVER_STREAM_START = 2,
+    SERVER_STREAM_COMPLETE = 3,
+    SERVER_STREAM_ERR = 4,
+    SERVER_STREAM_ASR_ERROR = 5,
+} server_stream_status_t;
+
+// 拍拍猪的状态,不同的状态将来有不同的灯语
+typedef enum {
+    PET_PIG_IDLE = 0,
+    PET_PIG_DISCONNECT_INTERNET = 1,
+    PET_PIG_DISCONNECT_SERVER = 2,
+    PET_PIG_SPEAKERING = 3,
+    PET_PIG_MIC_WORKING = 4,
+    PET_PIG_MAX_STATUS = 5
+} pet_pig_status_t;
+
+#define RING_BUF_MAX      (96 * 1024)
+#define MIC_BUF_MAX       (48 * 1024)
 #define MAX_RECV_BUF_SIZE (3 * 1024)
-#define SEND_I2S_SZIE (2*MAX_RECV_BUF_SIZE)
+#define SEND_I2S_SZIE     (2*MAX_RECV_BUF_SIZE)
 
 typedef struct {
-    uint8_t *buffer;       // 缓冲区数据
-    size_t capacity;       // 缓冲区总容量（建议设为音频帧大小的整数倍，如16384字节）
-    size_t in;             // 写入指针
-    size_t out;            // 读取指针
-    size_t len;            // 当前有效数据长度
-    SemaphoreHandle_t mutex; // 互斥锁（保护多线程访问）
-    // SemaphoreHandle_t sem;  // 信号量（数据可用时唤醒播放线程）
+    // 缓冲区数据
+    uint8_t *buffer;
+    // 缓冲区总容量
+    size_t capacity;
+    // 写入指针
+    size_t in;
+    // 读取指针
+    size_t out;
+    // 当前有效数据长度
+    size_t len;
+    // 互斥锁（保护多线程访问）
+    SemaphoreHandle_t mutex;
 } RingBuffer;
 
 typedef struct
@@ -50,7 +83,7 @@ typedef struct
     //上一次麦克风收到声音的时间
     int64_t                       last_recv_time;
     //麦克风收到的数据
-    int16_t                       recive_data[MAX_RECV_BUF_SIZE];
+    int8_t                        recive_data[MAX_RECV_BUF_SIZE];
     //是否从服务器收到了回包
     bool                          request_tag;
     //上一次给i2s输出语音的时间
@@ -67,10 +100,22 @@ typedef struct
     RingBuffer                   *audio_ringbuf;
     //mic数据环形缓冲区
     RingBuffer                   *mic_ringbuf;
-    //震动片振动发声音
-    bool                          shock;
     //对端服务器是否已经结束连接
     bool                          server_finish;
+    //音频流
+    audio_pipeline_handle_t       pipeline;
+    //读取音频流的handle
+    audio_element_handle_t        raw_read;
+    //重编码音频流的handle
+    audio_element_handle_t        filter;
+    //写入音频流的handle
+    audio_element_handle_t        raw_write;
+    //唤醒网络模型
+    esp_wn_iface_t               *wakenet;
+    //加载模型数据
+    model_iface_data_t           *model_data;
+    //模型需要加载的数据
+    int                           audio_chunksize;
 } pignet_server_t, *pignet_server_handle_t;
 
 #endif

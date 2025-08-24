@@ -18,6 +18,16 @@
 #include "cJSON.h"
 #include "esp_vad.h"
 
+#include "audio_pipeline.h"
+#include "audio_element.h"
+#include "audio_common.h"
+#include "audio_recorder.h"
+#include "esp_psram.h"
+
+#include "esp_audio.h"
+#include "filter_resample.h"
+#include "raw_stream.h"
+#include "recorder_sr.h"
 #include "pig_wifi.h"
 #include "esp_websocket_client.h"
 #include "speaker_config.h"
@@ -34,6 +44,21 @@
 #endif
 
 static const char *TAG = "i2s_es8311";
+
+static void enable_ns4150(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << NS4150B_CTRL),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(NS4150B_CTRL, 1);
+    ESP_LOGI(ES_TAG, "enable enable_ns4150!");
+    return;
+}
 
 static esp_err_t es8311_codec_init(void)
 {
@@ -76,7 +101,7 @@ static esp_err_t i2s_driver_init(pignet_server_handle_t p)
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &p->tx_handle, &p->rx_handle));
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(USER_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_MCK_IO,
             .bclk = I2S_BCK_IO,
@@ -95,6 +120,7 @@ static esp_err_t i2s_driver_init(pignet_server_handle_t p)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(p->rx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(p->rx_handle));
 
+    std_cfg.clk_cfg.sample_rate_hz = USER_SAMPLE_RATE;
     std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(p->tx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(p->tx_handle));
@@ -179,7 +205,7 @@ static void send_voice_tag_to_server(pignet_server_handle_t pig_server, int type
             ESP_LOGW(WEBSOCKET_SND, "send %d msg to server success", send_res);
         }
         if (type == END_VOICE) {
-            pig_server->recive_music_status = END_VOICE;
+            pig_server->recive_music_status = MIC_SALIENT;
         } else if (type == BEGIN_VOICE) {
             pig_server->recive_music_status = DURING_VOICE;
         }
@@ -191,25 +217,44 @@ static void send_voice_tag_to_server(pignet_server_handle_t pig_server, int type
     free(json_str);
 }
 
-static void send_msg_websocket_task(void *arg)
+static void send_msg_to_server_task(void *arg)
 {
-    pignet_server_handle_t p = (pignet_server_handle_t)(arg);
-    char                   buffer[MAX_RECV_BUF_SIZE] = {0};
-    int                    send_res = 0;
+    pignet_server_handle_t   p = (pignet_server_handle_t)(arg);
+    int                      send_res = 0;
+    int16_t                 *wakenet_buffer = NULL;
+
+    while (audio_pipeline_get_state(p->pipeline, AEL_STATE_RUNNING) != ESP_OK) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    wakenet_buffer = (int16_t *) malloc(p->audio_chunksize);
+    if (wakenet_buffer == NULL) {
+        ESP_LOGE(WEBSOCKET_SND, "Wakenet buffer malloc failed:%s", strerror(errno));
+        vTaskDelete(NULL);
+    }
 
     while (1) {
-        memset(buffer, 0, MAX_RECV_BUF_SIZE);
-        size_t read_len = ringbuf_read(p->mic_ringbuf, (uint8_t *)buffer, MAX_RECV_BUF_SIZE, pdMS_TO_TICKS(100));
+        size_t read_len = raw_stream_read(p->raw_write, wakenet_buffer, p->audio_chunksize);
+        // size_t read_len = raw_stream_read(p->raw_write, buffer, MAX_RECV_BUF_SIZE);
+        // size_t read_len = ringbuf_read(p->mic_ringbuf, (uint8_t *)buffer, MAX_RECV_BUF_SIZE, pdMS_TO_TICKS(100));
         if (read_len == 0) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
+
+        if (p->recive_music_status == MIC_SALIENT) {
+            wakenet_state_t state = p->wakenet->detect(p->model_data, wakenet_buffer);
+            if (state != WAKENET_DETECTED) {
+                continue;
+            }
+            ESP_LOGE(WEBSOCKET_SND, "voice has been detect!\n");
+            p->recive_music_status = BEGIN_VOICE;
+        }
+
         if (esp_websocket_client_is_connected(p->client) && wifi_connected() == ESP_OK && p->request_tag == false) {
             if (p->recive_music_status != DURING_VOICE) {
                 send_voice_tag_to_server(p, BEGIN_VOICE);
-                // vTaskDelay(300 / portTICK_PERIOD_MS);
             }
-            send_res = esp_websocket_client_send_bin(p->client, buffer, read_len, pdMS_TO_TICKS(1000));
+            send_res = esp_websocket_client_send_bin(p->client, wakenet_buffer, read_len, pdMS_TO_TICKS(1000));
             if (send_res != -1) {
                 ESP_LOGW(WEBSOCKET_SND, "send %d msg to server success", send_res);
                 p->recive_music_status = DURING_VOICE;
@@ -219,16 +264,21 @@ static void send_msg_websocket_task(void *arg)
             ESP_LOGW(WEBSOCKET_SND, "Don't allow send voice binary to socket server");
         }
     }
+    free(wakenet_buffer);
     vTaskDelete(NULL);
 }
 
-static void i2s_recieve(void *args)
+static void receive_data_from_mic_task(void *args)
 {
     esp_err_t              ret = ESP_OK;
     pignet_server_handle_t p = (pignet_server_t *)args;
     int64_t                current_time = esp_timer_get_time();
+    int                    vad_result = VAD_SILENCE;
 
-    ESP_LOGI(REV_TAG, "start i2s_recieve task");
+    ESP_LOGI(REV_TAG, "start receive_data_from_mic_task task!");
+    while (audio_pipeline_get_state(p->pipeline, AEL_STATE_RUNNING) != ESP_OK) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
     while(1) {
         memset(p->recive_data, 0, MAX_RECV_BUF_SIZE);
         ret = i2s_channel_read(p->rx_handle, p->recive_data, MAX_RECV_BUF_SIZE, &p->bytes_read, 1000);
@@ -236,12 +286,13 @@ static void i2s_recieve(void *args)
             ESP_LOGE(REV_TAG, "i2s read failed, %d", ret);
             continue;
         }
-        int vad_result = vad_process(p->vad, p->recive_data, USER_SAMPLE_RATE, 30);
 
-        if (vad_result == 1 && p->request_tag == false && p->shock == true) {
-            ringbuf_write(p->mic_ringbuf, (uint8_t *)p->recive_data, p->bytes_read);
+        vad_result = vad_process(p->vad, p->recive_data, USER_SAMPLE_RATE, 30);
+        if (vad_result == VAD_SPEECH && p->request_tag == false) {
+            raw_stream_write(p->raw_read, (char *)p->recive_data, p->bytes_read);
+            // ringbuf_write(p->mic_ringbuf, (uint8_t *)p->recive_data, p->bytes_read);
         } else {
-            ESP_LOGD(REV_TAG, "Silence detected:%d, or have recive request:%d, or shock status:%d", vad_result, p->request_tag, p->shock);
+            ESP_LOGD(REV_TAG, "Silence detected:%d, or have recive request:%d", vad_result, p->request_tag);
             current_time = esp_timer_get_time();
             if (p->recive_music_status == DURING_VOICE && (current_time - p->last_recv_time) >= 2*1000*1000) {
                 send_voice_tag_to_server(p, END_VOICE);
@@ -251,9 +302,9 @@ static void i2s_recieve(void *args)
     }
 }
 
-static void i2s_send(void *args)
+static void send_data_to_mic_task(void *args)
 {
-    ESP_LOGI(SND_TAG, "i2s_send start");
+    ESP_LOGI(SND_TAG, "send_data_to_mic_task start");
     esp_err_t               ret = ESP_OK;
     pignet_server_handle_t  p = (pignet_server_t *)args;
     uint8_t                *i2s_buffer = malloc(MAX_RECV_BUF_SIZE);
@@ -282,6 +333,10 @@ static void i2s_send(void *args)
             ESP_LOGE(SND_TAG, "[music] i2s music play failed.");
         }
     }
+    if (i2s_buffer) {
+        free(i2s_buffer);
+    }
+    vTaskDelete(NULL);
 }
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
@@ -310,19 +365,13 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 ESP_LOGW(TAG, "Received closed message with code=%d", 256 * data->data_ptr[0] + data->data_ptr[1]);
                 break;
             } else {
-                ESP_LOGW(TAG, "op_code:%d, Received msg:%d, msg:%s", data->op_code, data->data_len, data->data_ptr);
+                // ESP_LOGW(TAG, "op_code:%d, Received msg:%d, msg:%s", data->op_code, data->data_len, data->data_ptr);
                 char *json_str = calloc(data->data_len + 1, 1);
                 if (json_str) {
                     memcpy(json_str, data->data_ptr, data->data_len);
                     json_str[data->data_len] = '\0';
                     cJSON *json = cJSON_Parse(json_str);
                     if (json) {
-                        // const cJSON *audio_data = cJSON_GetObjectItem(json, "message");
-                        // if (cJSON_IsString(audio_data)) {
-                        //     ESP_LOGI(TAG, "Base64 audio_data (string): %s", audio_data->valuestring);
-                        // } else {
-                        //     ESP_LOGW(TAG, "audio_data not found or not a string");
-                        // }
                         cJSON_Delete(json);
                     } else {
                         ESP_LOGW(TAG, "Failed to parse JSON");
@@ -367,33 +416,14 @@ static void time_check_tag(void *arg)
         if (delta_us >= 500*1000 && pig_server->request_tag == true) {
             pig_server->request_tag = false;
             pig_server->last_send_time = current_time_us;
-            ESP_LOGE(TAG, "RECOVER pig_server->request_tag = false");
+            ESP_LOGE(TAG, "recover pig_server->request_tag = false");
         }
 
         if (pig_server->server_finish == true) {
             esp_websocket_client_start(pig_server->client);
         }
     }
-}
-
-static void enable_ns4150(void)
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << NS4150B_CTRL),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(NS4150B_CTRL, 1);
-    ESP_LOGI(ES_TAG, "enable enable_ns4150!");
-    return;
-}
-
-static void gpio_isr_handler(void* arg) {
-    pignet_server_handle_t p = (pignet_server_handle_t)arg;
-    p->shock = !p->shock;
+    vTaskDelete(NULL);
 }
 
 #ifdef CONFIG_DEBUG_SMALL_PIG
@@ -467,6 +497,19 @@ static void i2s_echo(void *args)
 }
 #endif
 
+static int input_cb_for_afe(int16_t *buffer, int buf_sz, void *user_ctx, TickType_t ticks)
+{
+    ESP_LOGI(TAG, "into input_cb_for_afe");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    return 0;
+    // return raw_stream_read(raw_read, (char *)buffer, buf_sz);
+}
+
+static esp_err_t rec_engine_cb(audio_rec_evt_t *event, void *user_data)
+{
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     /* Step1:  Initialize Net and NVS */
@@ -479,6 +522,34 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    ESP_LOGI(TAG, "Free memory: %" PRIu32 " bytes PSRAM memory %zu bytes", esp_get_free_heap_size(), esp_psram_get_size());
+    // 语音识别AFE代码，暂时保留
+    // char *audio_sr_input_fmt = "RM";
+    // recorder_sr_cfg_t recorder_sr_cfg = DEFAULT_RECORDER_SR_CFG(audio_sr_input_fmt, "model", AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    // recorder_sr_cfg.afe_cfg->afe_ringbuf_size = 30;
+    // recorder_sr_cfg.afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_INTERNAL;
+    // recorder_sr_cfg.afe_cfg->wakenet_init = true;
+    // recorder_sr_cfg.afe_cfg->vad_init = false;
+    // // recorder_sr_cfg.afe_cfg->vad_mode = VAD_MODE_4;
+    // recorder_sr_cfg.multinet_init = false;
+    // recorder_sr_cfg.rb_size = 2048;
+    // recorder_sr_cfg.afe_cfg->pcm_config.mic_num = 1;
+    // recorder_sr_cfg.afe_cfg->pcm_config.ref_num = 1;
+    // recorder_sr_cfg.afe_cfg->pcm_config.total_ch_num = 1;
+    // recorder_sr_cfg.afe_cfg->pcm_config.sample_rate = 16000;
+    // recorder_sr_cfg.afe_cfg->wakenet_mode = DET_MODE_90;
+    // audio_rec_cfg_t cfg = AUDIO_RECORDER_DEFAULT_CFG();
+    // cfg.read = (recorder_data_read_t)&input_cb_for_afe;
+    // cfg.sr_handle = recorder_sr_create(&recorder_sr_cfg, &cfg.sr_iface);
+    // if (cfg.sr_handle == NULL) {
+    //     printf("recorder_sr_create failed\n");
+    //     goto LOOP;
+    // }
+    // cfg.event_cb = rec_engine_cb;
+    // cfg.vad_off = 1000;
+    // audio_rec_handle_t  recorder = audio_recorder_create(&cfg);
+    // printf("recorder : %p\n", recorder);
 
     /* Step2: Initialize and connect wifi */
     ret = init_wifi();
@@ -493,12 +564,11 @@ void app_main(void)
         abort();
     }
     pig_server->audio_ringbuf = ringbuf_init(RING_BUF_MAX);
-    pig_server->mic_ringbuf = ringbuf_init(MIC_BUF_MAX);
+    // pig_server->mic_ringbuf = ringbuf_init(MIC_BUF_MAX);
     pig_server->vad = vad_create(VAD_MODE_2);
     pig_server->recive_music_status = END_VOICE;
     pig_server->request_tag = false;
     pig_server->server_finish = false;
-    pig_server->shock = false;
 
     /* Step4:  Initialize es8311 */
     if (i2s_driver_init(pig_server) != ESP_OK) {
@@ -519,29 +589,68 @@ void app_main(void)
     #ifdef CONFIG_DEBUG_SMALL_PIG
         xTaskCreate(i2s_music, "i2s_music", 8192, (void *)pig_server, 5, NULL);
     #else
-        xTaskCreate(i2s_recieve, "i2s_recieve", 8192, (void *)pig_server, 5, NULL);
+        xTaskCreate(receive_data_from_mic_task, "receive_data_from_mic_task", 4096, (void *)pig_server, 5, NULL);
     #endif
-    xTaskCreate(i2s_send, "i2s_send", 8192, (void *)pig_server, 5, NULL);
-    xTaskCreate(send_msg_websocket_task, "send_msg_websocket_task", 8192, (void *)pig_server, 5, NULL);
-    xTaskCreate(time_check_tag, "time_check_tag", 4096, (void *)pig_server, 5, NULL);
+    xTaskCreate(send_data_to_mic_task, "send_data_to_mic_task", 8192, (void *)pig_server, 5, NULL);
+    xTaskCreate(send_msg_to_server_task, "send_msg_to_server_task", 8192, (void *)pig_server, 5, NULL);
+    xTaskCreate(time_check_tag, "time_check_tag", 2048, (void *)pig_server, 5, NULL);
 
     /* Step6:  Initialize websocket app */
     websocket_app_start((void *)pig_server);
 
-    /* step7: 使能震动 */
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = HC_GPIO_INPUT_PIN_SEL,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE
-    };
-    gpio_config(&io_conf);
-    gpio_install_isr_service(1);
-    gpio_isr_handler_add(HC_GPIO_INPUT_IO, gpio_isr_handler, (void*)pig_server);
+    /* Step7:  Initialize wake word detection */
+    srmodel_list_t *models = esp_srmodel_init("model");
+    if (models == NULL) {
+        ESP_LOGE(PIG_SERVRE, "No srnodel model found");
+        abort();
+    }
+    char *model_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "hilexin");
+    if (model_name == NULL) {
+        ESP_LOGE(PIG_SERVRE, "No hilexin model found");
+        abort();
+    }
+    pig_server->wakenet = (esp_wn_iface_t*)esp_wn_handle_from_name(model_name);
+    if (pig_server->wakenet == NULL) {
+        ESP_LOGE(PIG_SERVRE, "No wakenet handle found");
+        abort();
+    }
+    pig_server->model_data = pig_server->wakenet->create(model_name, DET_MODE_95);
+    if (pig_server->model_data == NULL) {
+        ESP_LOGE(PIG_SERVRE, "create wakenet model data failed!");
+        abort();
+    }
+    pig_server->audio_chunksize = pig_server->wakenet->get_samp_chunksize(pig_server->model_data) * sizeof(int16_t);
+    ESP_LOGI(PIG_SERVRE, "pig_server->audio_chunksize:%d", pig_server->audio_chunksize);
+
+    /* Step8:  Initialize audio pipeline */
+    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
+    pig_server->pipeline = audio_pipeline_init(&pipeline_cfg);
+
+    raw_stream_cfg_t raw_cfg_in = RAW_STREAM_CFG_DEFAULT();
+    raw_cfg_in.type = AUDIO_STREAM_READER;
+    pig_server->raw_read = raw_stream_init(&raw_cfg_in);
+
+    rsp_filter_cfg_t filter_cfg = DEFAULT_RESAMPLE_FILTER_CONFIG();
+    filter_cfg.src_rate = USER_SAMPLE_RATE;
+    filter_cfg.src_ch = I2S_SLOT_MODE_STEREO;
+    filter_cfg.dest_rate = USER_SAMPLE_RATE;
+    filter_cfg.dest_ch = I2S_SLOT_MODE_MONO;
+    pig_server->filter = rsp_filter_init(&filter_cfg);
+
+    raw_stream_cfg_t raw_cfg_out = RAW_STREAM_CFG_DEFAULT();
+    raw_cfg_out.type = AUDIO_STREAM_WRITER;
+    pig_server->raw_write = raw_stream_init(&raw_cfg_out);
+
+    audio_pipeline_register(pig_server->pipeline, pig_server->raw_read, "raw_in");
+    audio_pipeline_register(pig_server->pipeline, pig_server->filter, "filter");
+    audio_pipeline_register(pig_server->pipeline, pig_server->raw_write, "raw_out");
+
+    const char *link_tag[3] = {"raw_in", "filter", "raw_out"};
+    audio_pipeline_link(pig_server->pipeline, &link_tag[0], 3);
+    audio_pipeline_run(pig_server->pipeline);
 
     while(1) {
         vTaskDelay(5000 / portTICK_PERIOD_MS);
-        ESP_LOGI(TAG, "Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
+        ESP_LOGI(TAG, "Free memory: %" PRIu32 " bytes PSRAM memory %zu bytes", esp_get_free_heap_size(), esp_psram_get_size());
     }
 }

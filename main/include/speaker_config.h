@@ -12,7 +12,7 @@
 #define USER_SAMPLE_RATE     (16000) //16000
 #define USER_MCLK_MULTIPLE   (384) // If not using 24-bit data width, 256 should be enough
 #define USER_MCLK_FREQ_HZ    (USER_SAMPLE_RATE * USER_MCLK_MULTIPLE)
-#define USER_VOICE_VOLUME    70
+#define USER_VOICE_VOLUME    75
 #if CONFIG_EXAMPLE_MODE_ECHO
 #define EXAMPLE_MIC_GAIN        CONFIG_EXAMPLE_MIC_GAIN
 #endif

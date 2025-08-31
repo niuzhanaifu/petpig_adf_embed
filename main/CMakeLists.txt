@@ -9,5 +9,5 @@ set(COMPONENT_ADD_INCLUDEDIRS
     "./../frwk/include"
 )
 set(COMPONENT_EMBED_TXTFILES "../extern_files/rcv.pcm")
-# spiffs_create_partition_image(model ../model FLASH_IN_PROJECT)
 register_component()
+spiffs_create_partition_image(src_audio ../AudioFiles FLASH_IN_PROJECT)

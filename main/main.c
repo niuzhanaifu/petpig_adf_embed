@@ -8,6 +8,7 @@
 #include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/temperature_sensor.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_timer.h"
@@ -15,6 +16,7 @@
 #include "nvs_flash.h"
 #include "esp_system.h"
 #include "esp_check.h"
+#include "esp_spiffs.h"
 #include "cJSON.h"
 #include "esp_vad.h"
 
@@ -43,7 +45,7 @@
     #define WEB_URI "ws://115.190.136.178:8000/ws/smart/chat"
 #endif
 
-static const char *TAG = "i2s_es8311";
+static const char *TAG = "common_pignet";
 
 static void enable_ns4150(void)
 {
@@ -247,10 +249,11 @@ static void send_msg_to_server_task(void *arg)
                 continue;
             }
             ESP_LOGE(WEBSOCKET_SND, "voice has been detect!\n");
-            p->recive_music_status = BEGIN_VOICE;
+            p->recive_music_status = MIC_DETECT;
+            xEventGroupSetBits(p->default_audio_play, PLAY_DEFAULT_AUDIO);
         }
 
-        if (esp_websocket_client_is_connected(p->client) && wifi_connected() == ESP_OK && p->request_tag == false) {
+        if (esp_websocket_client_is_connected(p->client) && p->recive_music_status != MIC_DETECT && p->request_tag == false) {
             if (p->recive_music_status != DURING_VOICE) {
                 send_voice_tag_to_server(p, BEGIN_VOICE);
             }
@@ -261,7 +264,7 @@ static void send_msg_to_server_task(void *arg)
                 p->last_recv_time = esp_timer_get_time();
             }
         } else {
-            ESP_LOGW(WEBSOCKET_SND, "Don't allow send voice binary to socket server");
+            ESP_LOGW(WEBSOCKET_SND, "Don't allow send voice binary to socket server, mic_status:%d, request_tag:%d", p->recive_music_status, p->request_tag);
         }
     }
     free(wakenet_buffer);
@@ -294,7 +297,7 @@ static void receive_data_from_mic_task(void *args)
         } else {
             ESP_LOGD(REV_TAG, "Silence detected:%d, or have recive request:%d", vad_result, p->request_tag);
             current_time = esp_timer_get_time();
-            if (p->recive_music_status == DURING_VOICE && (current_time - p->last_recv_time) >= 2*1000*1000) {
+            if (p->recive_music_status == DURING_VOICE && (current_time - p->last_recv_time) >= 3*1000*1000) {
                 send_voice_tag_to_server(p, END_VOICE);
                 p->last_recv_time = current_time;
             }
@@ -497,6 +500,86 @@ static void i2s_echo(void *args)
 }
 #endif
 
+static void player_default_audio_task(void *arg)
+{
+    pignet_server_handle_t pig_server = (pignet_server_handle_t)arg;
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs0",
+        .partition_label = "src_audio",
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount or format filesystem");
+        } else if (ret == ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "Failed to find SPIFFS partition");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        }
+        vTaskDelete(NULL);
+    }
+
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info(NULL, &total, &used);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+    }
+
+    const char *file_path = "/spiffs0/action.wav";
+    FILE *f = fopen(file_path, "rb");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file %s", file_path);
+        vTaskDelete(NULL);
+    }
+
+    // 获取文件大小
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    rewind(f);
+    ESP_LOGI(TAG, "File size: %ld bytes", file_size);
+
+    // 分配内存存储音频数据
+    uint8_t *audio_buf = (uint8_t *)malloc(file_size);
+    if (!audio_buf) {
+        ESP_LOGE(TAG, "malloc failed!");
+        fclose(f);
+        vTaskDelete(NULL);
+    }
+
+    fread(audio_buf, 1, file_size, f);
+    fclose(f);
+
+    ESP_LOGI(TAG, "Read audio data into RAM, start playing...");
+
+    size_t read_bytes = 0, written_bytes = 0;
+    while (1) {
+        xEventGroupWaitBits(pig_server->default_audio_play,
+                            PLAY_DEFAULT_AUDIO,
+                            pdTRUE,   // 播放后清除事件位
+                            pdFALSE,  // 不需要同时等待多个bit
+                            portMAX_DELAY);
+        read_bytes = 0;
+        ESP_LOGE(TAG, "Start to play default audio");
+        while (read_bytes < file_size) {
+            if ((file_size - read_bytes) < 1024) {
+                written_bytes = ringbuf_write(pig_server->audio_ringbuf, (uint8_t *)audio_buf + read_bytes, file_size - read_bytes);
+            } else {
+                written_bytes = ringbuf_write(pig_server->audio_ringbuf, (uint8_t *)audio_buf + read_bytes, 1024);
+            }
+            read_bytes += written_bytes;
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        pig_server->recive_music_status = BEGIN_VOICE;
+        pig_server->last_recv_time = esp_timer_get_time();
+    }
+    vTaskDelete(NULL);
+}
+
 static int input_cb_for_afe(int16_t *buffer, int buf_sz, void *user_ctx, TickType_t ticks)
 {
     ESP_LOGI(TAG, "into input_cb_for_afe");
@@ -566,9 +649,10 @@ void app_main(void)
     pig_server->audio_ringbuf = ringbuf_init(RING_BUF_MAX);
     // pig_server->mic_ringbuf = ringbuf_init(MIC_BUF_MAX);
     pig_server->vad = vad_create(VAD_MODE_2);
-    pig_server->recive_music_status = END_VOICE;
+    pig_server->recive_music_status = MIC_SALIENT;
     pig_server->request_tag = false;
     pig_server->server_finish = false;
+    pig_server->default_audio_play = xEventGroupCreate();
 
     /* Step4:  Initialize es8311 */
     if (i2s_driver_init(pig_server) != ESP_OK) {
@@ -649,8 +733,25 @@ void app_main(void)
     audio_pipeline_link(pig_server->pipeline, &link_tag[0], 3);
     audio_pipeline_run(pig_server->pipeline);
 
+    // step9: Create player default audio task
+    xTaskCreate(player_default_audio_task, "player_default_audio_task", 4096, (void *)pig_server, 5, NULL);
+
+    // step10: monitor free size and temperature
+    ESP_LOGI(TAG, "Install temperature sensor, expected temp ranger range: 10~50 ℃");
+    temperature_sensor_handle_t temp_sensor = NULL;
+    temperature_sensor_config_t temp_sensor_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
+    ESP_ERROR_CHECK(temperature_sensor_install(&temp_sensor_config, &temp_sensor));
+
+    ESP_LOGI(TAG, "Enable temperature sensor");
+    ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
+
+    ESP_LOGI(TAG, "Read temperature");
+    float tsens_value;
+
     while(1) {
         vTaskDelay(5000 / portTICK_PERIOD_MS);
+        ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
+        ESP_LOGI(TAG, "Temperature value %.02f ℃", tsens_value);
         ESP_LOGI(TAG, "Free memory: %" PRIu32 " bytes PSRAM memory %zu bytes", esp_get_free_heap_size(), esp_psram_get_size());
     }
 }

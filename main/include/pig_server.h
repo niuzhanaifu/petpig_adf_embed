@@ -11,6 +11,7 @@
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
 #include "model_path.h"
+#include "freertos/event_groups.h"
 #include <esp_websocket_client.h>
 
 #define PIG_SERVRE    "pig_server"
@@ -22,8 +23,6 @@
 #define SND_TAG       "i2s_send"
 #define RING_BUF      "ring_buf"
 #define PIG_STATUS    "PIG_STATUS"
-
-#define HC_GPIO_INPUT_PIN_SEL  (1ULL << HC_GPIO_INPUT_IO)
 
 // 麦克风的不同收音状态
 typedef enum {
@@ -54,6 +53,7 @@ typedef enum {
     PET_PIG_MAX_STATUS = 5
 } pet_pig_status_t;
 
+#define PLAY_DEFAULT_AUDIO (1 << 0)
 #define RING_BUF_MAX      (96 * 1024)
 #define MIC_BUF_MAX       (48 * 1024)
 #define MAX_RECV_BUF_SIZE (3 * 1024)
@@ -116,6 +116,8 @@ typedef struct
     model_iface_data_t           *model_data;
     //模型需要加载的数据
     int                           audio_chunksize;
+    //播放默认的问候声音
+    EventGroupHandle_t            default_audio_play;
 } pignet_server_t, *pignet_server_handle_t;
 
 #endif

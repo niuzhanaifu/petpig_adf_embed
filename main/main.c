@@ -35,12 +35,13 @@
 #include "speaker_config.h"
 #include "es8311.h"
 #include "pig_server.h"
+#include "ledc.h"
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 #define TEST_IN_MYSELF
 #ifdef TEST_IN_MYSELF
-    #define WEB_URI "ws://192.168.255.160:8000/smart/chat"
+    #define WEB_URI "ws://14.103.183.47:8000/smart/chat"
 #else
     #define WEB_URI "ws://115.190.136.178:8000/ws/smart/chat"
 #endif
@@ -207,7 +208,7 @@ static void send_voice_tag_to_server(pignet_server_handle_t pig_server, int type
             ESP_LOGW(WEBSOCKET_SND, "send %d msg to server success", send_res);
         }
         if (type == END_VOICE) {
-            pig_server->recive_music_status = MIC_SALIENT;
+            pig_server->recive_music_status = BEGIN_VOICE;
         } else if (type == BEGIN_VOICE) {
             pig_server->recive_music_status = DURING_VOICE;
         }
@@ -250,7 +251,8 @@ static void send_msg_to_server_task(void *arg)
             }
             ESP_LOGE(WEBSOCKET_SND, "voice has been detect!\n");
             p->recive_music_status = MIC_DETECT;
-            xEventGroupSetBits(p->default_audio_play, PLAY_DEFAULT_AUDIO);
+            set_rgb_led(1, 1, 0);
+            xEventGroupSetBits(p->default_audio_play, PLAY_FIRST_ACK_AUDIO);
         }
 
         if (esp_websocket_client_is_connected(p->client) && p->recive_music_status != MIC_DETECT && p->request_tag == false) {
@@ -293,11 +295,10 @@ static void receive_data_from_mic_task(void *args)
         vad_result = vad_process(p->vad, p->recive_data, USER_SAMPLE_RATE, 30);
         if (vad_result == VAD_SPEECH && p->request_tag == false) {
             raw_stream_write(p->raw_read, (char *)p->recive_data, p->bytes_read);
-            // ringbuf_write(p->mic_ringbuf, (uint8_t *)p->recive_data, p->bytes_read);
         } else {
             ESP_LOGD(REV_TAG, "Silence detected:%d, or have recive request:%d", vad_result, p->request_tag);
             current_time = esp_timer_get_time();
-            if (p->recive_music_status == DURING_VOICE && (current_time - p->last_recv_time) >= 3*1000*1000) {
+            if (p->recive_music_status == DURING_VOICE && (current_time - p->last_recv_time) >= 2*1000*1000) {
                 send_voice_tag_to_server(p, END_VOICE);
                 p->last_recv_time = current_time;
             }
@@ -362,6 +363,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 ESP_LOGI(TAG, "Received binary data:%d", data->data_len);
                 if (data->data_len >= 0) {
                     size_t written = ringbuf_write(pig_server->audio_ringbuf, (uint8_t *)data->data_ptr, data->data_len);
+                    pig_server->recv_data_size += written;
                 }
                 break;
             } else if (data->op_code == 0x08 && data->data_len == 2) {
@@ -420,6 +422,15 @@ static void time_check_tag(void *arg)
             pig_server->request_tag = false;
             pig_server->last_send_time = current_time_us;
             ESP_LOGE(TAG, "recover pig_server->request_tag = false");
+        }
+        if (delta_us >= 5*1000*1000 && pig_server->recive_music_status != MIC_SALIENT && pig_server->request_tag == false) {
+            if ((current_time_us > pig_server->last_recv_time) &&
+                (current_time_us - pig_server->last_recv_time) >= 5*1000*1000) {
+                //如果5秒没有收到麦克风数据，并且没有在播放音频，则认为本次对话结束，播放结束语句
+                xEventGroupSetBits(pig_server->default_audio_play, PLAY_SECOND_ACK_AUDIO);
+                ESP_LOGE(TAG, "5s no mic data, play final ack audio,last rev data:%lld", pig_server->recv_data_size);
+                pig_server->recv_data_size = 0;
+            }
         }
 
         if (pig_server->server_finish == true) {
@@ -528,55 +539,63 @@ static void player_default_audio_task(void *arg)
     } else {
         ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
     }
+    const char *file_paths[] = {
+        "/spiffs0/first_ack.pcm",
+        "/spiffs0/finally_ack.pcm"
+    };
 
-    const char *file_path = "/spiffs0/action.wav";
-    FILE *f = fopen(file_path, "rb");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file %s", file_path);
-        vTaskDelete(NULL);
-    }
-
-    // 获取文件大小
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    rewind(f);
-    ESP_LOGI(TAG, "File size: %ld bytes", file_size);
-
-    // 分配内存存储音频数据
-    uint8_t *audio_buf = (uint8_t *)malloc(file_size);
+    uint8_t *audio_buf = (uint8_t *)malloc(1024);
     if (!audio_buf) {
-        ESP_LOGE(TAG, "malloc failed!");
-        fclose(f);
+        ESP_LOGE(TAG, "Failed to allocate memory for audio buffer");
         vTaskDelete(NULL);
     }
-
-    fread(audio_buf, 1, file_size, f);
-    fclose(f);
-
-    ESP_LOGI(TAG, "Read audio data into RAM, start playing...");
-
-    size_t read_bytes = 0, written_bytes = 0;
     while (1) {
-        xEventGroupWaitBits(pig_server->default_audio_play,
-                            PLAY_DEFAULT_AUDIO,
+        EventBits_t bits = xEventGroupWaitBits(
+                            pig_server->default_audio_play,
+                            PLAY_FIRST_ACK_AUDIO | PLAY_SECOND_ACK_AUDIO,
                             pdTRUE,   // 播放后清除事件位
                             pdFALSE,  // 不需要同时等待多个bit
-                            portMAX_DELAY);
-        read_bytes = 0;
-        ESP_LOGE(TAG, "Start to play default audio");
-        while (read_bytes < file_size) {
-            if ((file_size - read_bytes) < 1024) {
-                written_bytes = ringbuf_write(pig_server->audio_ringbuf, (uint8_t *)audio_buf + read_bytes, file_size - read_bytes);
-            } else {
-                written_bytes = ringbuf_write(pig_server->audio_ringbuf, (uint8_t *)audio_buf + read_bytes, 1024);
+                            portMAX_DELAY
+                        );
+        const char *selected_file = NULL;
+        if (bits & PLAY_FIRST_ACK_AUDIO) {
+            selected_file = file_paths[0];
+            ESP_LOGI(TAG, "Playing first audio file: %s", selected_file);
+        } else if (bits & PLAY_SECOND_ACK_AUDIO) {
+            selected_file = file_paths[1];
+            ESP_LOGI(TAG, "Playing second audio file: %s", selected_file);
+        } else {
+            continue; // 没有有效的事件位，继续等待
+        }
+        ESP_LOGE(TAG, "Start to play %s audio", selected_file);
+        if (selected_file) {
+            FILE *f = fopen(selected_file, "rb");
+            if (f == NULL) {
+                ESP_LOGE(TAG, "Failed to open file %s", selected_file);
+                continue;
             }
-            read_bytes += written_bytes;
-            vTaskDelay(20 / portTICK_PERIOD_MS);
+
+            size_t read_bytes = 0;
+            while ((read_bytes = fread(audio_buf, 1, 1024, f)) > 0) {
+                size_t written_bytes = ringbuf_write(pig_server->audio_ringbuf, audio_buf, read_bytes);
+                if (written_bytes < read_bytes) {
+                    ESP_LOGW(TAG, "Ring buffer full, written %d bytes, dropped %d bytes", written_bytes, read_bytes - written_bytes);
+                }
+                vTaskDelay(20 / portTICK_PERIOD_MS); // 模拟播放延迟
+            }
+            fclose(f);
+            ESP_LOGI(TAG, "Finished playing audio file: %s", selected_file);
         }
         vTaskDelay(100 / portTICK_PERIOD_MS);
-        pig_server->recive_music_status = BEGIN_VOICE;
+        if (bits & PLAY_FIRST_ACK_AUDIO) {
+            pig_server->recive_music_status = BEGIN_VOICE;
+        } else if (bits & PLAY_SECOND_ACK_AUDIO) {
+            pig_server->recive_music_status = MIC_SALIENT;
+            set_rgb_led(0, 1, 1);
+        }
         pig_server->last_recv_time = esp_timer_get_time();
     }
+    free(audio_buf);
     vTaskDelete(NULL);
 }
 
@@ -596,6 +615,9 @@ static esp_err_t rec_engine_cb(audio_rec_evt_t *event, void *user_data)
 void app_main(void)
 {
     /* Step1:  Initialize Net and NVS */
+    ledc_init();
+    enable_rgb_led();
+    set_rgb_led(0, 1, 1); // 红色表示正在初始化
     esp_err_t ret;
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());

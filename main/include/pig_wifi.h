@@ -1,7 +1,7 @@
 #include <esp_err.h>
 
 /* STA Configuration */
-#define EXAMPLE_ESP_WIFI_STA_SSID           "xikas"
+#define EXAMPLE_ESP_WIFI_STA_SSID           "HONOR 80 GT"
 #define EXAMPLE_ESP_WIFI_STA_PASSWD         "300075zl"
 #define EXAMPLE_ESP_MAXIMUM_RETRY           10
 

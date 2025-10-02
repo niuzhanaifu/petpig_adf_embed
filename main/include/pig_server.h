@@ -26,11 +26,11 @@
 
 // 麦克风的不同收音状态
 typedef enum {
-    MIC_SALIENT = 0,
-    MIC_DETECT = 1,
-    BEGIN_VOICE = 2,
-    DURING_VOICE = 3,
-    END_VOICE = 4
+    MIC_SALIENT = 0,  // 静音状态
+    MIC_DETECT = 1,   // 检测到唤醒词
+    BEGIN_VOICE = 2,  // 开始说话
+    DURING_VOICE = 3, // 正在说话
+    END_VOICE = 4     // 说话结束
 } voice_status_tag;
 
 // 从服务器接收数据流的不同状态
@@ -53,7 +53,9 @@ typedef enum {
     PET_PIG_MAX_STATUS = 5
 } pet_pig_status_t;
 
-#define PLAY_DEFAULT_AUDIO (1 << 0)
+#define PLAY_FIRST_ACK_AUDIO (1 << 0)
+#define PLAY_SECOND_ACK_AUDIO (1 << 1)
+
 #define RING_BUF_MAX      (96 * 1024)
 #define MIC_BUF_MAX       (48 * 1024)
 #define MAX_RECV_BUF_SIZE (3 * 1024)
@@ -118,6 +120,8 @@ typedef struct
     int                           audio_chunksize;
     //播放默认的问候声音
     EventGroupHandle_t            default_audio_play;
+    //一次从服务器返回的数据量
+    uint64_t                      recv_data_size;
 } pignet_server_t, *pignet_server_handle_t;
 
 #endif
